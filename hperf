@@ -1,0 +1,148 @@
+#!/bin/bash
+#Author billming
+
+#configurations
+PROJ_DIR="/aa/bb/cc/"
+PROCESS_NAME="com.example.com"
+
+LIB_PATH="${PROJ_DIR}/obj/local/armeabi/"
+PROFILER_SO="./libs/armeabi/libheap_profiler.so"
+HEAP_DUMPER="./libs/armeabi/heap_dump"
+# It's the place in where logs and tools will be placed.
+REMOTE_TMP="/data/local/tmp"
+
+if [[ ! -f $PROFILER_SO ]] || [[ ! -f $HEAP_DUMPER ]]; then
+    echo $HEAP_DUMPER not found, probably you may forget to compile?
+    echo If yes, do $ndk-build first.
+    exit
+fi
+
+which dot > /dev/null
+if [[ $? != 0 ]]; then
+    echo Please install graphviz
+    exit
+fi
+
+echo Testing adb su...
+adb shell true
+if [[ $? != 0 ]]; then
+    echo adb error
+    exit
+fi
+
+adb shell "su -c true"
+if [[ $? != 0 ]]; then
+    echo adb shell su failed.
+    exit
+fi
+
+echo Killing ${PROCESS_NAME} instances...
+adb shell am force-stop ${PROCESS_NAME}
+
+# Prepare dumps folder
+DUMPS_DIR=./dumps/$(date +"%Y%m%d-%H-%M-%S")
+mkdir -p ${DUMPS_DIR}
+
+echo Sending files...
+adb push $PROFILER_SO $REMOTE_TMP
+adb push $HEAP_DUMPER $REMOTE_TMP
+
+echo Setting up LD_PRELOAD...
+# for android 5.0
+adb shell su -c "setenforce Permissive"
+adb shell su -c "setprop wrap.${PROCESS_NAME} LD_PRELOAD=/data/local/tmp/libheap_profiler.so"
+echo
+echo
+echo Now, you may launch the application, then follow the
+echo instructions below to capture memory logs.
+
+print_help() {
+    echo Press:
+    echo "(d) to dump a memory snapshot."
+    #echo "(s) to pull logs back into ./dumps folder"
+    echo "(l) to pull libs into ./sysroot"
+    echo "(q) to quit."
+}
+
+SNAPSHOTS=""
+creat_snapshot() {
+    BPID=$(adb shell ps | sed -n "s/[^ ]*\s*\([0-9]*\).*${PROCESS_NAME}\s*$/\1/p")
+    if [[ -z $BPID ]]; then
+        echo Process not found.
+        return
+    fi
+    FNAME=${BPID}_$(date +"%Y%m%d-%H-%M-%S").heap
+    echo Dumping PID: $BPID to $FNAME
+    adb shell su -c "${REMOTE_TMP}/heap_dump -o ${REMOTE_TMP}/${FNAME} $BPID"
+    SNAPSHOTS="${SNAPSHOTS} ${FNAME}"
+    echo Done.
+}
+
+pull_snapshots() {
+    for i in $SNAPSHOTS; do
+        echo Pulling ${i}...
+        adb shell su -c "chmod 755 ${REMOTE_TMP}/${i}"
+        adb pull ${REMOTE_TMP}/${i} $DUMPS_DIR/${i}
+        adb shell su -c "rm ${REMOTE_TMP}/$i"
+        SNAPSHOTS_PULLED=1
+    done
+    echo Done.
+    SNAPSHOTS=""
+}
+
+pull_libs() {
+    BPID=$(adb shell ps | sed -n "s/[^ ]*\s*\([0-9]*\).*${PROCESS_NAME}\s*$/\1/p")
+    if [[ -z $BPID ]]; then
+        echo Process not found.
+        return
+    fi
+    LIBS=$(adb shell su -c "cat /proc/${BPID}/maps" | grep -o -e '\/.*\.so\|\/.*app_process' | uniq)
+    rm -rf ./sysroot
+    mkdir -p ./sysroot
+    for i in $LIBS; do
+        echo Pulling ${i}
+        adb pull $i ./sysroot/${i}
+    done
+    echo Done.
+}
+
+clean_exit() {
+    echo Clearing LD_PRELOAD...
+    adb shell su -c "setprop wrap.${PROCESS_NAME} \"\""
+
+    #Generate report
+    if [[ ! -z ${SNAPSHOTS_PULLED} ]]; then
+        for DUMP_FILE in ${DUMPS_DIR}/*.heap; do
+            #./pprof --lib_prefix=./sysroot --callgrind ./sysroot/system/bin/app_process $DUMP_FILE > ${DUMP_FILE}.callgrind
+            ./pprof --lib_prefix=./sysroot --svg --nodefraction=.002 --edgefraction=.001 --nodecount=300 ./sysroot/system/bin/app_process $DUMP_FILE > ${DUMP_FILE}.svg
+            ./pprof --lib_prefix=./sysroot --text ./sysroot/system/bin/app_process $DUMP_FILE
+            ./pprof --lib_prefix=./sysroot --callgrind ./sysroot/system/bin/app_process $DUMP_FILE > ${DUMP_FILE}.callgrind
+        done
+        cp diff.sh ${DUMPS_DIR}
+    fi
+    echo Done.
+    exit
+}
+
+print_help
+while read -r -n1 CHAR
+do
+    echo ""
+    if [[ $CHAR == "d" ]]; then
+        creat_snapshot
+    fi
+    #if [[ $CHAR == "s" ]]; then
+    #   pull_snapshots
+    #fi
+    if [[ $CHAR == "l" ]]; then
+        pull_libs
+        print_help
+    fi
+    if [[ $CHAR == "q" ]]; then
+        if [[ ! -d ./sysroot ]]; then
+            pull_libs
+        fi
+        pull_snapshots
+        clean_exit
+    fi
+done
